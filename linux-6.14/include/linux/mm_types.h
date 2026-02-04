@@ -1034,6 +1034,10 @@ struct mm_struct {
 #endif
 		struct work_struct async_put_work;
 
+		struct vm_area_struct *ept_vma;     /* User-space VMA for exposed PTEs */
+		unsigned long *ept_user_addr;       /* User-space address of flat table */
+		spinlock_t ept_lock;                /* Lock for ept operations */
+
 #ifdef CONFIG_IOMMU_MM_DATA
 		struct iommu_mm_data *iommu_mm;
 #endif

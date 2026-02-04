@@ -1361,4 +1361,12 @@ config PT_RECLAIM
 
 source "mm/damon/Kconfig"
 
+config EPT
+	bool "Exposed Page Tables support"
+	default n
+	help
+	  Enable /dev/ept device for exposing process page tables
+	  to user-space in a flat table format.
+
+
 endmenu

@@ -1293,6 +1293,11 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_init_uprobes_state(mm);
 	hugetlb_count_init(mm);
 
+	/* EPT: Initialize exposed page table tracking */
+	mm->ept_vma = NULL;
+	mm->ept_user_addr = NULL;
+	spin_lock_init(&mm->ept_lock);
+
 	if (current->mm) {
 		mm->flags = mmf_init_flags(current->mm->flags);
 		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
