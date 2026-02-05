@@ -1,71 +1,3 @@
-// /* SPDX-License-Identifier: GPL-2.0-only */
-// #include <linux/init.h>
-// #include <linux/miscdevice.h>
-// #include <linux/mm.h>
-// #include <linux/fs.h>
-// #include <linux/sched/mm.h>
-// #include <linux/printk.h>
-// #include <linux/capability.h>
-// #include <asm/tlbflush.h>
-
-// // Ο custom fault handler
-// static vm_fault_t ept_fault(struct vm_fault *vmf)
-// {
-//     // Για δοκιμή επιστρέφουμε τη zero page. 
-//     // Εδώ θα μπει αργότερα ο walker σου.
-//     vmf->page = ZERO_PAGE(vmf->address);
-//     get_page(vmf->page);
-//     return 0;
-// }
-
-// static const struct vm_operations_struct ept_vm_ops = {
-//     .fault = ept_fault,
-// };
-
-// static int ept_mmap(struct file *file, struct vm_area_struct *vma)
-// {
-//     if (!capable(CAP_SYS_ADMIN))
-//         return -EPERM;
-    
-//     vma->vm_ops = &ept_vm_ops;
-//     return 0;
-// }
-
-// static const struct file_operations ept_fops = {
-//     .owner = THIS_MODULE,
-//     .mmap = ept_mmap,
-// };
-
-// static struct miscdevice ept_dev = {
-//     .minor = MISC_DYNAMIC_MINOR,
-//     .name = "ept",
-//     .fops = &ept_fops,
-//     .mode = 0600,
-// };
-
-// // ΑΥΤΟ ΕΛΕΙΠΕ: Η υλοποίηση της συνάρτησης που καλεί το memory.c
-// void ept_sync_address(struct mm_struct *mm, unsigned long address)
-// {
-//     if (!mm || mm == &init_mm)
-//         return;
-
-//     // Η πιο ασφαλής εντολή για να μην κολλάει το σύστημα
-//     flush_tlb_mm(mm);
-// }
-// EXPORT_SYMBOL(ept_sync_address);
-
-// static int __init ept_init(void)
-// {
-//     return misc_register(&ept_dev);
-// }
-
-// // Για built-in σε mm/ χρησιμοποιούμε συνήθως fs_initcall ή device_initcall
-// device_initcall(ept_init);
-
-
-
-
-
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <linux/module.h>
 #include <linux/miscdevice.h>
@@ -83,13 +15,23 @@
 static vm_fault_t ept_fault(struct vm_fault *vmf) {
     printk(KERN_INFO "EPT: ept_fault ENTER\n");
     struct mm_struct *mm = vmf->vma->vm_mm;
-    unsigned long index = vmf->pgoff;
-    unsigned long target_va = index << PAGE_SHIFT;
+
+    unsigned long uaddr = vmf->address & PAGE_MASK;
+
+    /* ποια 4KB ept-page έγινε fault μέσα στο mapping; */
+    unsigned long page_no = (uaddr - vmf->vma->vm_start) >> PAGE_SHIFT;
+
+    /* κάθε ept page έχει 512 entries (4096/8) */
+    unsigned long first_entry_index = page_no << 9;   // *512
+
+    /* το VA του process που αντιστοιχεί στο πρώτο entry αυτής της ept-page */
+    unsigned long target_va = first_entry_index << PAGE_SHIFT;
+
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
     unsigned long pfn_value;
-    
-    printk(KERN_INFO "EPT fault: index=%lu, target_va=0x%lx, fault_addr=0x%lx\n",
-           index, target_va, vmf->address);
+
+    printk(KERN_INFO "EPT fault: page_no=%lu first_entry=%lu target_va=0x%lx fault_addr=0x%lx\n",
+       page_no, first_entry_index, target_va, vmf->address);
     
     // Άμυνα: Αν το target_va είναι 0 ή εκτός user space, return zero page
     if (target_va >= TASK_SIZE) {
@@ -117,38 +59,14 @@ static vm_fault_t ept_fault(struct vm_fault *vmf) {
     }
     
     pmd = pmd_offset(pud, target_va);
-    if (pmd_none(*pmd) || pmd_bad(*pmd)) {
+    if (pmd_none(*pmd) || pmd_bad(*pmd) || pmd_leaf(*pmd)) {
         printk(KERN_INFO "EPT: pmd none/bad\n");
         goto zero_page;
     }
     
-    if (pmd_leaf(*pmd)) {
-        printk(KERN_INFO "EPT: pmd leaf (huge page)\n");
-        goto zero_page;
-    }
-
-    struct page *pte_page = pmd_page(*pmd);
-    if (!pte_page) goto zero_page;
-
-    pfn_value = page_to_pfn(pte_page);
+    pfn_value = page_to_pfn(pmd_page(*pmd));
     
     printk(KERN_INFO "EPT: found pte_page_pfn=0x%lx\n", pfn_value);
-    return vmf_insert_pfn(vmf->vma, vmf->address, pfn_value);
-    
-    // ΕΔΩ ΕΙΝΑΙ ΤΟ ΚΡΙΤΙΚΟ: pte_offset_kernel() μπορεί να επιστρέψει NULL
-    pte = pte_offset_kernel(pmd, target_va);
-    if (!pte) {
-        printk(KERN_INFO "EPT: pte_offset_kernel returned NULL\n");
-        goto zero_page;
-    }
-    
-    if (!pte_present(*pte)) {
-        printk(KERN_INFO "EPT: pte not present\n");
-        goto zero_page;
-    }
-    
-    pfn_value = pte_pfn(*pte);
-    printk(KERN_INFO "EPT: found pfn=0x%lx\n", pfn_value);
     return vmf_insert_pfn(vmf->vma, vmf->address, pfn_value);
 
 zero_page:
@@ -219,34 +137,28 @@ static struct miscdevice ept_dev = {
 };
 
 void ept_sync_address(struct mm_struct *mm, unsigned long address) {
-    unsigned long vpn = address >> PAGE_SHIFT;
-    struct vm_area_struct *ept_vma;
-    unsigned long __user *ept_user_addr;
-    
-    printk(KERN_INFO "EPT sync: address=0x%lx, vpn=%lu\n", address, vpn);
+    struct vm_area_struct *vma;
     
     spin_lock(&mm->ept_lock);
-    ept_vma = mm->ept_vma;
-    ept_user_addr = mm->ept_user_addr;
-    spin_unlock(&mm->ept_lock);
-    
-    if (!ept_vma || !ept_user_addr) {
-        printk(KERN_INFO "EPT sync: no ept mapping\n");
+    vma = mm->ept_vma;
+    if (!vma) {
+        spin_unlock(&mm->ept_lock);
         return;
     }
     
-    if (vpn < (1ULL << (48 - 12))) {
-        // Safe write to user-space
-        if (put_user(0UL, &ept_user_addr[vpn]) == 0) {
-            // TLB shootdown for user-space
-            if (ept_vma->vm_mm)
-                flush_tlb_page(ept_vma, address);
-        }
-    }
+    // address: η διεύθυνση του χρήστη (π.χ. της main)
+    // vpn: το offset μέσα στο δικό μας ept mapping
+    unsigned long vpn = address >> PAGE_SHIFT;
+    unsigned long ept_fault_addr = vma->vm_start + (vpn * sizeof(unsigned long));
+
+    // Αντί για put_user, καθαρίζουμε το PTE του exposed mapping
+    // Έτσι την επόμενη φορά που ο χρήστης θα διαβάσει το ept[vpn], θα ξαναμπει στην ept_fault
+    zap_vma_ptes(vma, ept_fault_addr, PAGE_SIZE);
     
-    // Standard TLB flush for kernel
+    spin_unlock(&mm->ept_lock);
+    
+    // Flush TLB για να σιγουρευτούμε ότι η αλλαγή φαίνεται αμέσως
     flush_tlb_mm_range(mm, address, address + PAGE_SIZE, PAGE_SHIFT, false);
-    printk(KERN_INFO "EPT sync: done\n");
 }
 EXPORT_SYMBOL(ept_sync_address);
 
